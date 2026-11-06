@@ -51,7 +51,6 @@ def get_redaction_patterns() -> List[Tuple[re.Pattern, str]]:
         val = os.environ.get(env_var)
         if val:
             user_paths.append(val)
-            # Often last component of USERPROFILE is username
             base = os.path.basename(val)
             if base and len(base) > 1:
                 user_names.add(base)
@@ -59,9 +58,7 @@ def get_redaction_patterns() -> List[Tuple[re.Pattern, str]]:
     for p in user_paths:
         norm = os.path.normpath(p)
         escaped_norm = re.escape(norm)
-        # Redact the user profile directory
         patterns.append((re.compile(escaped_norm, re.IGNORECASE), "<USERPROFILE>"))
-        # Also redact forward-slash variant
         patterns.append((re.compile(re.escape(norm.replace("\\", "/")), re.IGNORECASE), "<USERPROFILE>"))
 
     # Generic Windows C:\Users\<Username> and C:\Documents and Settings\<Username>
@@ -147,10 +144,19 @@ class SyncMapping:
 def normalize_local_path(path: str) -> str:
     """Normalize local file path for consistent prefix matching.
     
+    Handles paths with spaces, brackets, hashes, unicode accents.
     Converts forward slashes, strips trailing separators (unless root),
     and standardizes casing on Windows.
     """
-    abs_path = os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+    if not path:
+        return ""
+    clean = path.strip("\ufeff\u200b\u200e\u200f \t\r\n")
+    if (clean.startswith('"') and clean.endswith('"')) or (clean.startswith("'") and clean.endswith("'")):
+        clean = clean[1:-1].strip()
+
+    expanded = os.path.expanduser(os.path.expandvars(clean))
+    abs_path = os.path.abspath(expanded)
+    
     # Strip Windows extended-length prefix if present for clean string operations
     if abs_path.startswith("\\\\?\\UNC\\"):
         abs_path = "\\\\" + abs_path[8:]
@@ -267,7 +273,6 @@ def get_windows_registry_mappings(verbose: bool = False) -> List[SyncMapping]:
                                     logger.debug(f"[Registry Personal Root] Mapped {acc_name}: {norm_folder} -> {personal_url}")
 
                         # Check ScopeId caches inside this account
-                        # ScopeIdToMountPointPathCache & ScopeIdToWebUrlPathCache
                         try:
                             scope_mounts: Dict[str, str] = {}
                             scope_urls: Dict[str, str] = {}
@@ -363,10 +368,14 @@ def inspect_onedrive_ini_settings(verbose: bool = False) -> List[SyncMapping]:
 def encode_sharepoint_url_path(rel_path: str) -> str:
     """Encode relative path segment using standard SharePoint URL encoding.
     
-    SharePoint expects '/' as directory separator, and spaces/special characters
-    percent-encoded (%20, etc.), while preserving slashes.
+    Preserves directories and handles spaces, symbols, and Unicode while escaping
+    special characters (%20, # -> %23, etc.) conforming to SharePoint standards.
     """
-    clean_parts = [urllib.parse.quote(part) for part in rel_path.replace("\\", "/").strip("/").split("/") if part]
+    clean_parts = [
+        urllib.parse.quote(part) 
+        for part in rel_path.replace("\\", "/").strip("/").split("/") 
+        if part
+    ]
     return "/".join(clean_parts)
 
 
@@ -389,7 +398,7 @@ def resolve_file_to_urls(
         mount_norm = normalize_local_path(m.mount_point)
         mount_lower = mount_norm.lower()
 
-        # Ensure exact folder prefix match
+        # Match exact root or folder boundary
         if file_lower == mount_lower or file_lower.startswith(mount_lower + os.sep):
             if len(mount_norm) > best_len:
                 best_len = len(mount_norm)
@@ -410,14 +419,12 @@ def resolve_file_to_urls(
     encoded_rel = encode_sharepoint_url_path(rel_path) if rel_path else ""
 
     if best_mapping.scope_type == "personal" and "onedrive.live.com" in url_base:
-        # Personal web url
         if encoded_rel:
             web_url = f"{url_base}&id={urllib.parse.quote(rel_path)}"
         else:
             web_url = url_base
         direct_url = web_url
     else:
-        # Business / SharePoint Online library
         if encoded_rel:
             web_url = f"{url_base}/{encoded_rel}"
         else:
@@ -450,53 +457,117 @@ def collect_files_from_folder(
                 yield entry.path
 
 
+def _is_path_like(text: str) -> bool:
+    """Heuristic to check if a string looks like a file/directory path rather than a column header."""
+    clean = text.strip("\ufeff\u200b\u200e\u200f \"'\t\r\n")
+    if not clean:
+        return False
+    # Drive letter: C:\ or C:/
+    if len(clean) >= 2 and clean[1] == ":" and (clean[0].isalpha()):
+        return True
+    # UNC or root path
+    if clean.startswith("\\\\") or clean.startswith("//") or clean.startswith("/") or clean.startswith("\\"):
+        return True
+    # Common separators with extension
+    if ("\\" in clean or "/" in clean) and "." in os.path.basename(clean):
+        return True
+    return False
+
+
 def collect_files_from_csv(csv_path: str, column_name: Optional[str] = None) -> Iterator[str]:
     """Read local file paths from a CSV file.
     
-    If column_name is given, reads that column. Otherwise uses first column.
+    Guarantees that spaces, parentheses, brackets, hashes, and special characters
+    inside file paths are preserved and NEVER truncated by space delimiters.
     """
     norm_csv = normalize_local_path(csv_path)
     if not os.path.isfile(norm_csv):
         raise ValueError(f"CSV file not found: {redact_path(csv_path)}")
 
     with open(norm_csv, mode="r", encoding="utf-8-sig", errors="replace") as f:
-        sample = f.read(2048)
-        f.seek(0)
-        delimiter = ","
-        try:
-            sniffer = csv.Sniffer()
-            dialect = sniffer.sniff(sample)
+        lines = [line for line in f]
+
+    if not lines:
+        return
+
+    # 1. Detect standard CSV delimiter strictly from standard symbols (comma, semicolon, tab, pipe)
+    # NEVER include ' ' (space) or ':' (colon) as delimiter candidates!
+    first_lines = lines[:20]
+    sample_text = "".join(first_lines)
+
+    delimiter = ","
+    try:
+        sniffer = csv.Sniffer()
+        dialect = sniffer.sniff(sample_text, delimiters=",\t;|")
+        if dialect.delimiter in (",", "\t", ";", "|"):
             delimiter = dialect.delimiter
-        except Exception:
-            pass
+    except Exception:
+        # Fallback heuristic: check which delimiter appears most consistently
+        for cand in (",", "\t", ";", "|"):
+            if cand in sample_text:
+                delimiter = cand
+                break
 
-        reader = csv.reader(f, delimiter=delimiter)
-        header = next(reader, None)
-        if not header:
-            return
+    # 2. Parse using Python's standard csv.reader with the strict non-space delimiter
+    reader = csv.reader(lines, delimiter=delimiter)
+    all_rows = list(reader)
 
-        col_idx = 0
-        has_headers = False
+    if not all_rows:
+        return
 
-        if column_name:
-            for idx, col in enumerate(header):
-                if col.strip().lower() == column_name.strip().lower():
-                    col_idx = idx
-                    has_headers = True
-                    break
+    first_row = [c.strip() for c in all_rows[0] if c is not None]
+
+    # Determine target column index
+    col_idx = 0
+    start_row_idx = 0
+
+    if column_name:
+        for idx, col in enumerate(first_row):
+            if col.strip().lower() == column_name.strip().lower():
+                col_idx = idx
+                start_row_idx = 1
+                break
+    else:
+        # If no explicit column given, check if first row contains a column header or is already a path
+        first_entry = first_row[0] if first_row else ""
+        if _is_path_like(first_entry):
+            # First row is actual data (e.g. single column of paths without headers)
+            start_row_idx = 0
         else:
-            first_val = header[0].strip()
-            if not os.path.exists(first_val) and not (":" in first_val or "/" in first_val or "\\" in first_val):
-                has_headers = True
-            else:
-                yield first_val
+            # First row is likely header
+            # Find candidate column by name if present
+            candidate_found = False
+            for idx, col in enumerate(first_row):
+                if any(k in col.lower() for k in ("path", "file", "location", "full_name", "filepath", "filename", "url")):
+                    col_idx = idx
+                    candidate_found = True
+                    break
+            start_row_idx = 1
 
-        for row in reader:
-            if not row or len(row) <= col_idx:
-                continue
-            val = row[col_idx].strip()
-            if val:
-                yield val
+    for row_idx in range(start_row_idx, len(all_rows)):
+        row = all_rows[row_idx]
+        if not row:
+            continue
+        if len(row) <= col_idx:
+            # If row was not split by delimiter, check full raw line
+            raw_line = lines[row_idx].strip("\r\n")
+            if raw_line:
+                clean_raw = raw_line.strip("\ufeff\u200b\u200e\u200f \"'")
+                if clean_raw:
+                    yield clean_raw
+            continue
+
+        raw_val = row[col_idx]
+        if not raw_val:
+            continue
+
+        # Strip surrounding quotes and invisible zero-width spaces without touching internal spaces
+        clean_val = raw_val.strip("\ufeff\u200b\u200e\u200f \t\r\n")
+        if (clean_val.startswith('"') and clean_val.endswith('"')) or (clean_val.startswith("'") and clean_val.endswith("'")):
+            clean_val = clean_val[1:-1].strip()
+
+        if clean_val:
+            yield clean_val
 
 
 def process_files(
@@ -591,7 +662,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--column",
         dest="column_name",
         default=None,
-        help="Column header name in input CSV containing file paths (default: first column)."
+        help="Column header name in input CSV containing file paths (default: auto-detected or first column)."
     )
     parser.add_argument(
         "--mount",

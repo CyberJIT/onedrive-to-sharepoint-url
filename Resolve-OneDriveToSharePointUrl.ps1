@@ -26,7 +26,7 @@
     Switch to scan folders and subfolders recursively.
 
 .PARAMETER Column
-    Header name of the column in the input CSV containing file paths (default: first column).
+    Header name of the column in the input CSV containing file paths (default: auto-detected or first column).
 
 .PARAMETER Mount
     Optional manual mapping override(s) formatted as 'LocalPath=RemoteUrl'.
@@ -117,7 +117,13 @@ function Normalize-LocalPath {
     param ([string]$InputPath)
     if ([string]::IsNullOrWhiteSpace($InputPath)) { return "" }
     
-    $expanded = [System.Environment]::ExpandEnvironmentVariables($InputPath)
+    # Strip quotes and zero-width characters while preserving internal spaces
+    $cleaned = $InputPath.Trim(" `t`r`n`uFEFF`u200B`u200E`u200F")
+    if (($cleaned.StartsWith('"') -and $cleaned.EndsWith('"')) -or ($cleaned.StartsWith("'") -and $cleaned.EndsWith("'"))) {
+        $cleaned = $cleaned.Substring(1, $cleaned.Length - 2).Trim()
+    }
+    
+    $expanded = [System.Environment]::ExpandEnvironmentVariables($cleaned)
     $resolved = [System.IO.Path]::GetFullPath($expanded)
     
     # Remove extended length prefix if present
@@ -403,16 +409,68 @@ if ($PSCmdlet.ParameterSetName -eq "Folder") {
     }
 
     Write-SafeHost "Reading file paths from CSV: $normCsv..." -ForegroundColor Cyan
-    $csvData = Import-Csv -Path $normCsv
+
+    # Inspect first lines to detect delimiter and presence of headers safely
+    $rawLines = Get-Content -Path $normCsv -Encoding UTF8 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if ($rawLines.Count -eq 0) {
+        Write-SafeWarning "CSV file is empty."
+        exit 0
+    }
+
+    $firstLine = $rawLines[0].Trim(" `t`r`n`uFEFF`u200B`u200E`u200F")
+    
+    # Check if first line is comma, semicolon, tab, or pipe separated
+    $delimiter = ","
+    if ($firstLine -match ";") { $delimiter = ";" }
+    elseif ($firstLine -match "`t") { $delimiter = "`t" }
+    elseif ($firstLine -match "\|") { $delimiter = "|" }
+
+    $csvData = Import-Csv -Path $normCsv -Delimiter $delimiter -Encoding UTF8
+
     if ($csvData.Count -gt 0) {
+        $props = $csvData[0].PSObject.Properties.Name
         $targetCol = $Column
+
         if ([string]::IsNullOrWhiteSpace($targetCol)) {
-            $targetCol = $csvData[0].PSObject.Properties.Name | Select-Object -First 1
+            # Heuristic: check if any property matches path/file
+            foreach ($p in $props) {
+                if ($p -match "(?i)path|file|location|filename|filepath|url") {
+                    $targetCol = $p
+                    break
+                }
+            }
+            if ([string]::IsNullOrWhiteSpace($targetCol)) {
+                $targetCol = $props | Select-Object -First 1
+            }
         }
+
+        # Check if first row was actually data rather than header
+        $firstVal = $props | Select-Object -First 1
+        if ($firstVal -match '^[A-Za-z]:[\\/]' -or $firstVal.StartsWith("\\") -or $firstVal.StartsWith("/")) {
+            $targetFiles.Add($firstVal.Trim())
+        }
+
         foreach ($row in $csvData) {
             $val = $row.$targetCol
             if (-not [string]::IsNullOrWhiteSpace($val)) {
-                $targetFiles.Add($val.Trim())
+                $cleanVal = $val.Trim(" `t`r`n`uFEFF`u200B`u200E`u200F")
+                if (($cleanVal.StartsWith('"') -and $cleanVal.EndsWith('"')) -or ($cleanVal.StartsWith("'") -and $cleanVal.EndsWith("'"))) {
+                    $cleanVal = $cleanVal.Substring(1, $cleanVal.Length - 2).Trim()
+                }
+                if (-not [string]::IsNullOrWhiteSpace($cleanVal)) {
+                    $targetFiles.Add($cleanVal)
+                }
+            }
+        }
+    } else {
+        # Fallback to plain line reading if Import-Csv failed
+        foreach ($line in $rawLines) {
+            $cleanLine = $line.Trim(" `t`r`n`uFEFF`u200B`u200E`u200F")
+            if (($cleanLine.StartsWith('"') -and $cleanLine.EndsWith('"')) -or ($cleanLine.StartsWith("'") -and $cleanLine.EndsWith("'"))) {
+                $cleanLine = $cleanLine.Substring(1, $cleanLine.Length - 2).Trim()
+            }
+            if (-not [string]::IsNullOrWhiteSpace($cleanLine)) {
+                $targetFiles.Add($cleanLine)
             }
         }
     }

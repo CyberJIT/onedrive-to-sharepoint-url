@@ -73,10 +73,52 @@ class TestOneDriveToSharePointUrl(unittest.TestCase):
         self.assertIsNone(url)
         self.assertIsNone(mount)
 
+    def test_collect_files_from_csv_with_spaces_and_special_chars(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = os.path.join(tmpdir, "input_with_spaces.csv")
+            # Unquoted and quoted lines with internal spaces and brackets
+            content = (
+                "C:\\Users\\John Doe\\OneDrive - Contoso\\ESMO 2026 documents\\Study Protocol (Phase 3).pdf\n"
+                '"C:\\Users\\John Doe\\OneDrive - Contoso\\ESMO 2026 documents\\Data Sheet [Final].xlsx"\n'
+                "C:\\Users\\John Doe\\OneDrive - Contoso\\ESMO 2026 documents\\Folder #1\\Appendix A.docx\n"
+            )
+            with open(csv_path, "w", encoding="utf-8") as fp:
+                fp.write(content)
+
+            files = list(collect_files_from_csv(csv_path))
+            self.assertEqual(len(files), 3)
+            self.assertEqual(
+                files[0],
+                r"C:\Users\John Doe\OneDrive - Contoso\ESMO 2026 documents\Study Protocol (Phase 3).pdf"
+            )
+            self.assertEqual(
+                files[1],
+                r"C:\Users\John Doe\OneDrive - Contoso\ESMO 2026 documents\Data Sheet [Final].xlsx"
+            )
+            self.assertEqual(
+                files[2],
+                r"C:\Users\John Doe\OneDrive - Contoso\ESMO 2026 documents\Folder #1\Appendix A.docx"
+            )
+
+    def test_collect_files_from_csv_with_header_and_comma(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = os.path.join(tmpdir, "input.csv")
+            with open(csv_path, "w", newline="", encoding="utf-8") as fp:
+                writer = csv.writer(fp)
+                writer.writerow(["File Location", "Status"])
+                writer.writerow([r"C:\Users\John Doe\OneDrive\Doc 1.docx", "Active"])
+                writer.writerow([r"C:\Users\John Doe\OneDrive\Doc 2.xlsx", "Pending"])
+
+            files = list(collect_files_from_csv(csv_path))
+            self.assertEqual(files, [
+                r"C:\Users\John Doe\OneDrive\Doc 1.docx",
+                r"C:\Users\John Doe\OneDrive\Doc 2.xlsx"
+            ])
+
     def test_process_files_csv_output(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            f1 = os.path.join(tmpdir, "test1.txt")
-            f2 = os.path.join(tmpdir, "test2.docx")
+            f1 = os.path.join(tmpdir, "test 1.txt")
+            f2 = os.path.join(tmpdir, "test 2 (final).docx")
             f3 = os.path.join(tmpdir, "outside.pdf")
             for f in (f1, f2, f3):
                 with open(f, "w") as fp:
@@ -101,20 +143,9 @@ class TestOneDriveToSharePointUrl(unittest.TestCase):
                 rows = list(csv.DictReader(fp))
                 self.assertEqual(len(rows), 3)
                 self.assertEqual(rows[0]["resolution_status"], "RESOLVED")
-                self.assertIn("https://company.sharepoint.com/sites/Docs/test1.txt", rows[0]["sharepoint_web_url"])
+                self.assertIn("https://company.sharepoint.com/sites/Docs/test%201.txt", rows[0]["sharepoint_web_url"])
+                self.assertIn("https://company.sharepoint.com/sites/Docs/test%202%20%28final%29.docx", rows[1]["sharepoint_web_url"])
                 self.assertEqual(rows[2]["resolution_status"], "NOT_IN_ONEDRIVE_MOUNT")
-
-    def test_collect_files_from_csv(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            csv_path = os.path.join(tmpdir, "input.csv")
-            with open(csv_path, "w", newline="", encoding="utf-8") as fp:
-                writer = csv.writer(fp)
-                writer.writerow(["FilePath", "Status"])
-                writer.writerow(["C:\\OneDrive\\Doc1.docx", "Active"])
-                writer.writerow(["C:\\OneDrive\\Doc2.xlsx", "Pending"])
-
-            files = list(collect_files_from_csv(csv_path, column_name="FilePath"))
-            self.assertEqual(files, ["C:\\OneDrive\\Doc1.docx", "C:\\OneDrive\\Doc2.xlsx"])
 
 
 if __name__ == "__main__":
