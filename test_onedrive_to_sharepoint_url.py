@@ -15,11 +15,25 @@ from onedrive_to_sharepoint_url import (
     encode_sharepoint_url_path,
     normalize_local_path,
     process_files,
+    redact_path,
     resolve_file_to_urls,
 )
 
 
 class TestOneDriveToSharePointUrl(unittest.TestCase):
+
+    def test_redact_path(self):
+        # Test Windows user path redaction
+        win_path = r"C:\Users\johndoe\OneDrive - Contoso\file.txt"
+        redacted = redact_path(win_path)
+        self.assertNotIn("johndoe", redacted)
+        self.assertIn(r"C:\Users\<USER>\OneDrive - Contoso\file.txt", redacted)
+
+        # Test Unix user path redaction
+        unix_path = "/Users/alice/Documents/file.pdf"
+        redacted_u = redact_path(unix_path)
+        self.assertNotIn("alice", redacted_u)
+        self.assertIn("/Users/<USER>/Documents/file.pdf", redacted_u)
 
     def test_encode_sharepoint_url_path(self):
         rel = r"Folder Name\Sub Folder\My Document (2026).docx"
@@ -39,7 +53,6 @@ class TestOneDriveToSharePointUrl(unittest.TestCase):
                 scope_type="business"
             ),
         ]
-        # Sort mappings descending by mount_point length
         mappings.sort(key=lambda x: len(x.mount_point), reverse=True)
 
         # File in nested library

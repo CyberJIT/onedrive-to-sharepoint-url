@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import logging
 import os
 import posixpath
+import re
 import sys
+import traceback
 import urllib.parse
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
@@ -25,6 +28,111 @@ try:
     import winreg
 except ImportError:
     winreg = None  # type: ignore
+
+
+# ==============================================================================
+# Path Sanitization & Safe Redaction Engine
+# ==============================================================================
+
+def get_redaction_patterns() -> List[Tuple[re.Pattern, str]]:
+    """Build dynamic regular expression patterns to redact local usernames and user profile paths."""
+    patterns = []
+    
+    # 1. System user names and home directory paths
+    user_names = set()
+    user_paths = []
+    
+    for env_var in ("USERNAME", "USER", "LOGNAME"):
+        val = os.environ.get(env_var)
+        if val and len(val) > 1:
+            user_names.add(val)
+
+    for env_var in ("USERPROFILE", "HOME"):
+        val = os.environ.get(env_var)
+        if val:
+            user_paths.append(val)
+            # Often last component of USERPROFILE is username
+            base = os.path.basename(val)
+            if base and len(base) > 1:
+                user_names.add(base)
+
+    for p in user_paths:
+        norm = os.path.normpath(p)
+        escaped_norm = re.escape(norm)
+        # Redact the user profile directory
+        patterns.append((re.compile(escaped_norm, re.IGNORECASE), "<USERPROFILE>"))
+        # Also redact forward-slash variant
+        patterns.append((re.compile(re.escape(norm.replace("\\", "/")), re.IGNORECASE), "<USERPROFILE>"))
+
+    # Generic Windows C:\Users\<Username> and C:\Documents and Settings\<Username>
+    patterns.append((
+        re.compile(r'([A-Za-z]:\\Users\\)[^\s\\\'\"\,]+', re.IGNORECASE),
+        r'\1<USER>'
+    ))
+    patterns.append((
+        re.compile(r'([A-Za-z]:/Users/)[^\s/\'\"\,]+', re.IGNORECASE),
+        r'\1<USER>'
+    ))
+    # Unix /Users/<Username> or /home/<Username>
+    patterns.append((
+        re.compile(r'(/Users/)[^\s/\'\"\,]+', re.IGNORECASE),
+        r'\1<USER>'
+    ))
+    patterns.append((
+        re.compile(r'(/home/)[^\s/\'\"\,]+', re.IGNORECASE),
+        r'\1<USER>'
+    ))
+
+    # Redact explicit username if still present
+    for u in user_names:
+        if len(u) >= 3:
+            patterns.append((re.compile(re.escape(u), re.IGNORECASE), "<USER>"))
+
+    return patterns
+
+
+_REDACTION_PATTERNS = get_redaction_patterns()
+
+
+def redact_path(text: str) -> str:
+    """Sanitize any string containing local paths or usernames for safe log output."""
+    if not isinstance(text, str):
+        text = str(text)
+    for pattern, replacement in _REDACTION_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+class SanitizedFormatter(logging.Formatter):
+    """Logging formatter that intercepts formatted messages and stack traces to redact local paths."""
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        return redact_path(formatted)
+
+
+def safe_excepthook(exc_type, exc_val, exc_tb):
+    """Top-level unhandled exception hook redacting local user paths from tracebacks."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_val, exc_tb)
+        return
+    tb_text = "".join(traceback.format_exception(exc_type, exc_val, exc_tb))
+    sanitized = redact_path(tb_text)
+    sys.stderr.write(f"\n[CRITICAL UNHANDLED EXCEPTION]\n{sanitized}\n")
+
+
+sys.excepthook = safe_excepthook
+
+# Configure package logger
+logger = logging.getLogger("OneDriveUrlResolver")
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(SanitizedFormatter("%(message)s"))
+logger.addHandler(_log_handler)
+logger.setLevel(logging.INFO)
+
+
+def safe_print(msg: str, file=sys.stdout):
+    """Print to console with guaranteed local path redaction."""
+    print(redact_path(msg), file=file)
 
 
 @dataclass
@@ -51,15 +159,32 @@ def normalize_local_path(path: str) -> str:
     return os.path.normpath(abs_path)
 
 
-def get_windows_registry_mappings() -> List[SyncMapping]:
+def _safe_query_reg_value(key, value_names: Sequence[str]) -> Optional[str]:
+    """Safely query any of the specified registry value names from an open key."""
+    if not winreg or not key:
+        return None
+    for name in value_names:
+        try:
+            val, _ = winreg.QueryValueEx(key, name)
+            if val and str(val).strip():
+                return str(val).strip()
+        except OSError:
+            continue
+    return None
+
+
+def get_windows_registry_mappings(verbose: bool = False) -> List[SyncMapping]:
     """Inspect Windows Registry for active OneDrive / SharePoint sync scopes.
     
     Checks:
     1. HKCU\\Software\\SyncEngines\\Providers\\OneDrive (All synced libraries & folders)
     2. HKCU\\Software\\Microsoft\\OneDrive\\Accounts (Business1..N, Personal)
+    3. HKCU\\Software\\Microsoft\\OneDrive\\Accounts\\*\\ScopeIdToMountPointPathCache & ScopeIdToWebUrlPathCache
     """
     mappings: List[SyncMapping] = []
     if not winreg:
+        if verbose:
+            logger.debug("[Registry] winreg module not available on this platform.")
         return mappings
 
     # 1. Primary SyncEngines provider keys
@@ -67,80 +192,69 @@ def get_windows_registry_mappings() -> List[SyncMapping]:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sync_engines_path, 0, winreg.KEY_READ) as base_key:
             subkeys_count, _, _ = winreg.QueryInfoKey(base_key)
+            if verbose:
+                logger.debug(f"[Registry] Found {subkeys_count} subkeys in {sync_engines_path}")
             for i in range(subkeys_count):
                 try:
                     subkey_name = winreg.EnumKey(base_key, i)
                     sub_path = f"{sync_engines_path}\\{subkey_name}"
                     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub_path, 0, winreg.KEY_READ) as sub_key:
-                        mount_point = ""
-                        url_namespace = ""
-                        try:
-                            mount_point, _ = winreg.QueryValueEx(sub_key, "MountPoint")
-                        except OSError:
-                            pass
-                        
-                        # UrlNamespace is the canonical SharePoint URL root
-                        for url_prop in ("UrlNamespace", "WebUrl", "LibraryScopeUrl"):
-                            try:
-                                url_val, _ = winreg.QueryValueEx(sub_key, url_prop)
-                                if url_val:
-                                    url_namespace = url_val
-                                    break
-                            except OSError:
-                                pass
+                        mount_point = _safe_query_reg_value(sub_key, ["MountPoint"])
+                        url_namespace = _safe_query_reg_value(
+                            sub_key,
+                            ["UrlNamespace", "Url", "WebUrl", "LibraryScopeUrl"]
+                        )
 
                         if mount_point and url_namespace:
+                            norm_mount = normalize_local_path(mount_point)
+                            clean_url = url_namespace.rstrip("/")
                             mappings.append(SyncMapping(
-                                mount_point=normalize_local_path(mount_point),
-                                url_namespace=url_namespace.rstrip("/"),
+                                mount_point=norm_mount,
+                                url_namespace=clean_url,
                                 scope_type="business",
                                 account_name=subkey_name,
                             ))
-                except OSError:
+                            if verbose:
+                                logger.debug(f"[Registry SyncEngines] Mapped: {norm_mount} -> {clean_url}")
+                except OSError as e:
+                    if verbose:
+                        logger.debug(f"[Registry SyncEngines] Skip subkey index {i}: {e}")
                     continue
-    except OSError:
-        pass
+    except OSError as e:
+        if verbose:
+            logger.debug(f"[Registry SyncEngines] Key not found or inaccessible: {e}")
 
-    # 2. Accounts subkeys (Business and Personal roots)
+    # 2. Accounts subkeys (Business and Personal roots & ScopeId Caches)
     accounts_path = r"Software\Microsoft\OneDrive\Accounts"
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, accounts_path, 0, winreg.KEY_READ) as acc_base_key:
             acc_count, _, _ = winreg.QueryInfoKey(acc_base_key)
+            if verbose:
+                logger.debug(f"[Registry Accounts] Found {acc_count} accounts in {accounts_path}")
             for i in range(acc_count):
                 try:
                     acc_name = winreg.EnumKey(acc_base_key, i)
                     acc_sub_path = f"{accounts_path}\\{acc_name}"
                     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, acc_sub_path, 0, winreg.KEY_READ) as acc_key:
-                        user_folder = ""
-                        service_endpoint = ""
-                        cid = ""
-
-                        try:
-                            user_folder, _ = winreg.QueryValueEx(acc_key, "UserFolder")
-                        except OSError:
-                            pass
-
-                        try:
-                            service_endpoint, _ = winreg.QueryValueEx(acc_key, "ServiceEndpointUri")
-                        except OSError:
-                            pass
-
-                        try:
-                            cid, _ = winreg.QueryValueEx(acc_key, "CID")
-                        except OSError:
-                            pass
+                        user_folder = _safe_query_reg_value(acc_key, ["UserFolder"])
+                        service_endpoint = _safe_query_reg_value(
+                            acc_key,
+                            ["ServiceEndpointUri", "ServiceEndpointUriSharedWithMe", "DavUrlNamespace"]
+                        )
+                        cid = _safe_query_reg_value(acc_key, ["CID"])
 
                         if user_folder:
                             norm_folder = normalize_local_path(user_folder)
-                            # Only add if not already covered by a more specific MountPoint
                             if service_endpoint:
-                                # Often points to https://<tenant>-my.sharepoint.com/personal/...
+                                clean_endpoint = service_endpoint.rstrip("/")
                                 mappings.append(SyncMapping(
                                     mount_point=norm_folder,
-                                    url_namespace=service_endpoint.rstrip("/"),
+                                    url_namespace=clean_endpoint,
                                     scope_type="business",
                                     account_name=acc_name,
-                                Kupp = None if False else None))
+                                ))
+                                if verbose:
+                                    logger.debug(f"[Registry Account Root] Mapped {acc_name}: {norm_folder} -> {clean_endpoint}")
                             elif acc_name.lower() == "personal" or cid:
                                 personal_url = f"https://onedrive.live.com/?cid={cid}" if cid else "https://onedrive.live.com"
                                 mappings.append(SyncMapping(
@@ -149,15 +263,59 @@ def get_windows_registry_mappings() -> List[SyncMapping]:
                                     scope_type="personal",
                                     account_name=acc_name,
                                 ))
-                except OSError:
+                                if verbose:
+                                    logger.debug(f"[Registry Personal Root] Mapped {acc_name}: {norm_folder} -> {personal_url}")
+
+                        # Check ScopeId caches inside this account
+                        # ScopeIdToMountPointPathCache & ScopeIdToWebUrlPathCache
+                        try:
+                            scope_mounts: Dict[str, str] = {}
+                            scope_urls: Dict[str, str] = {}
+                            
+                            mount_cache_path = f"{acc_sub_path}\\ScopeIdToMountPointPathCache"
+                            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, mount_cache_path, 0, winreg.KEY_READ) as mc_key:
+                                mc_values_count, _, _ = winreg.QueryInfoKey(mc_key)
+                                for j in range(mc_values_count):
+                                    v_name, v_val, _ = winreg.EnumValue(mc_key, j)
+                                    if v_val:
+                                        scope_mounts[v_name] = str(v_val)
+
+                            url_cache_path = f"{acc_sub_path}\\ScopeIdToWebUrlPathCache"
+                            try:
+                                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, url_cache_path, 0, winreg.KEY_READ) as uc_key:
+                                    uc_values_count, _, _ = winreg.QueryInfoKey(uc_key)
+                                    for j in range(uc_values_count):
+                                        v_name, v_val, _ = winreg.EnumValue(uc_key, j)
+                                        if v_val:
+                                            scope_urls[v_name] = str(v_val)
+                            except OSError:
+                                pass
+
+                            for s_id, m_path in scope_mounts.items():
+                                u_target = scope_urls.get(s_id)
+                                if u_target:
+                                    mappings.append(SyncMapping(
+                                        mount_point=normalize_local_path(m_path),
+                                        url_namespace=u_target.rstrip("/"),
+                                        scope_type="business",
+                                        account_name=f"{acc_name}_{s_id[:8]}",
+                                    ))
+                                    if verbose:
+                                        logger.debug(f"[Registry ScopeIdCache] Mapped {s_id}: {m_path} -> {u_target}")
+                        except OSError:
+                            pass
+                except OSError as e:
+                    if verbose:
+                        logger.debug(f"[Registry Accounts] Skip account index {i}: {e}")
                     continue
-    except OSError:
-        pass
+    except OSError as e:
+        if verbose:
+            logger.debug(f"[Registry Accounts] Key not found or inaccessible: {e}")
 
     return mappings
 
 
-def inspect_onedrive_ini_settings() -> List[SyncMapping]:
+def inspect_onedrive_ini_settings(verbose: bool = False) -> List[SyncMapping]:
     """Inspect local OneDrive ClientPolicy.ini or settings .ini files as fallback."""
     mappings: List[SyncMapping] = []
     local_app_data = os.environ.get("LOCALAPPDATA")
@@ -168,7 +326,6 @@ def inspect_onedrive_ini_settings() -> List[SyncMapping]:
     if not os.path.isdir(settings_dir):
         return mappings
 
-    # Check for Personal or Business directories
     for root, _, files in os.walk(settings_dir):
         for f in files:
             if f.endswith(".ini") and f != "ClientPolicy.ini":
@@ -176,7 +333,6 @@ def inspect_onedrive_ini_settings() -> List[SyncMapping]:
                 try:
                     with open(ini_path, "r", encoding="utf-8", errors="ignore") as fp:
                         content = fp.read()
-                        # Search for DavUrlNamespace or local library mapping lines if available
                         dav_ns = None
                         mount = None
                         for line in content.splitlines():
@@ -189,13 +345,15 @@ def inspect_onedrive_ini_settings() -> List[SyncMapping]:
                                 parts = line.split("=", 1)
                                 if len(parts) == 2:
                                     mount = parts[1].strip().strip('"')
-                        if dav_ns and mount and os.path.exists(mount):
+                        if dav_ns and mount:
                             mappings.append(SyncMapping(
                                 mount_point=normalize_local_path(mount),
                                 url_namespace=dav_ns.rstrip("/"),
                                 scope_type="business",
                                 account_name="settings_ini",
                             ))
+                            if verbose:
+                                logger.debug(f"[Settings INI] Found {mount} -> {dav_ns}")
                 except Exception:
                     continue
 
@@ -276,12 +434,11 @@ def collect_files_from_folder(
     """Yield file paths from a folder directory."""
     norm_folder = normalize_local_path(folder_path)
     if not os.path.isdir(norm_folder):
-        raise ValueError(f"Path is not a valid directory: {folder_path}")
+        raise ValueError(f"Path is not a valid directory: {redact_path(folder_path)}")
 
     if recursive:
         for root, _, files in os.walk(norm_folder):
             for f in sorted(files):
-                # Skip desktop.ini and OneDrive hidden sync state files
                 if f.lower() in ("desktop.ini", "thumbs.db", ".ds_store"):
                     continue
                 yield os.path.join(root, f)
@@ -300,10 +457,9 @@ def collect_files_from_csv(csv_path: str, column_name: Optional[str] = None) -> 
     """
     norm_csv = normalize_local_path(csv_path)
     if not os.path.isfile(norm_csv):
-        raise ValueError(f"CSV file not found: {csv_path}")
+        raise ValueError(f"CSV file not found: {redact_path(csv_path)}")
 
     with open(norm_csv, mode="r", encoding="utf-8-sig", errors="replace") as f:
-        # Sniff delimiter or fallback to comma
         sample = f.read(2048)
         f.seek(0)
         delimiter = ","
@@ -329,12 +485,10 @@ def collect_files_from_csv(csv_path: str, column_name: Optional[str] = None) -> 
                     has_headers = True
                     break
         else:
-            # Check if header looks like an actual column name rather than a path
             first_val = header[0].strip()
             if not os.path.exists(first_val) and not (":" in first_val or "/" in first_val or "\\" in first_val):
                 has_headers = True
             else:
-                # First line might actually be data!
                 yield first_val
 
         for row in reader:
@@ -348,7 +502,8 @@ def collect_files_from_csv(csv_path: str, column_name: Optional[str] = None) -> 
 def process_files(
     file_paths: Iterator[str],
     mappings: Sequence[SyncMapping],
-    output_csv_path: str
+    output_csv_path: str,
+    verbose: bool = False
 ) -> Dict[str, int]:
     """Process files, resolve their SharePoint URLs, and write output CSV."""
     norm_out = normalize_local_path(output_csv_path)
@@ -384,11 +539,15 @@ def process_files(
             if web_url:
                 status = "RESOLVED"
                 stats["resolved"] += 1
+                if verbose:
+                    safe_print(f"  [OK] {fname} -> {web_url}")
             else:
                 status = "NOT_IN_ONEDRIVE_MOUNT"
                 stats["unmatched"] += 1
                 web_url = ""
                 mount_pt = ""
+                if verbose:
+                    safe_print(f"  [SKIP] {fname} (Not inside any detected OneDrive mount)")
 
             writer.writerow({
                 "local_file_path": norm_f,
@@ -405,7 +564,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert local OneDrive / SharePoint file paths to SharePoint Online URLs and export to CSV."
     )
-    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group = parser.add_mutually_exclusive_group(required=False)
     input_group.add_argument(
         "-p", "--path",
         dest="folder_path",
@@ -420,7 +579,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "-o", "--output",
         dest="output_csv",
-        required=True,
+        default=None,
         help="Path for destination CSV file output."
     )
     parser.add_argument(
@@ -439,18 +598,33 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         dest="manual_mounts",
         action="append",
         metavar="LOCAL_PATH=WEB_URL",
-        help="Manual mapping override in format: C:\\Local\\Folder=https://tenant.sharepoint.com/sites/library (can specify multiple times)."
+        help="Manual mapping override in format: C:\\Local\\Folder=https://tenant.sharepoint.com/sites/library"
     )
     parser.add_argument(
         "--list-mounts",
         action="store_true",
         help="List detected OneDrive / SharePoint mount points and exit."
     )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose diagnostics logging with automatic local path redaction."
+    )
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.list_mounts:
+        if not (args.folder_path or args.input_csv):
+            parser.error("one of the arguments -p/--path or -c/--csv is required (unless --list-mounts is specified)")
+        if not args.output_csv:
+            parser.error("the following arguments are required: -o/--output")
+
+    return args
 
 
-def get_all_sync_mappings(manual_mounts: Optional[List[str]] = None) -> List[SyncMapping]:
+def get_all_sync_mappings(
+    manual_mounts: Optional[List[str]] = None,
+    verbose: bool = False
+) -> List[SyncMapping]:
     """Retrieve all available sync mappings from registry, fallback configs, and CLI overrides."""
     mappings: List[SyncMapping] = []
 
@@ -465,12 +639,14 @@ def get_all_sync_mappings(manual_mounts: Optional[List[str]] = None) -> List[Syn
                     scope_type="manual",
                     account_name="CLI_OVERRIDE",
                 ))
+                if verbose:
+                    safe_print(f"[CLI Mount Override] {lp.strip()} -> {url.strip()}")
 
     # 2. Windows Registry
-    mappings.extend(get_windows_registry_mappings())
+    mappings.extend(get_windows_registry_mappings(verbose=verbose))
 
     # 3. Settings files fallback
-    mappings.extend(inspect_onedrive_ini_settings())
+    mappings.extend(inspect_onedrive_ini_settings(verbose=verbose))
 
     # Deduplicate while preserving priority (longest mount points first)
     unique_mappings: List[SyncMapping] = []
@@ -489,20 +665,23 @@ def get_all_sync_mappings(manual_mounts: Optional[List[str]] = None) -> List[Syn
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
-    mappings = get_all_sync_mappings(args.manual_mounts)
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
+    mappings = get_all_sync_mappings(args.manual_mounts, verbose=args.verbose)
 
     if args.list_mounts:
-        print(f"Discovered {len(mappings)} OneDrive / SharePoint sync mapping(s):")
+        safe_print(f"\nDiscovered {len(mappings)} OneDrive / SharePoint sync mapping(s):")
         for idx, m in enumerate(mappings, 1):
-            print(f" [{idx}] [{m.scope_type}] Local: {m.mount_point}")
-            print(f"      Remote: {m.url_namespace}")
+            safe_print(f" [{idx}] [{m.scope_type}] Local: {m.mount_point}")
+            safe_print(f"      Remote: {m.url_namespace}")
         return 0
 
     if not mappings:
-        print(
+        safe_print(
             "WARNING: No active OneDrive / SharePoint sync mappings detected via Windows Registry.\n"
             "If running outside standard sync or in testing, supply manual mappings using:\n"
-            "  --mount \"C:\\Users\\User\\OneDrive - Company=https://company.sharepoint.com/sites/MySite\"",
+            "  --mount \"C:\\Users\\<USER>\\OneDrive - Company=https://company.sharepoint.com/sites/MySite\"",
             file=sys.stderr
         )
 
@@ -513,17 +692,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             file_iter = collect_files_from_csv(args.input_csv, column_name=args.column_name)
 
-        stats = process_files(file_iter, mappings, args.output_csv)
+        stats = process_files(file_iter, mappings, args.output_csv, verbose=args.verbose)
 
-        print("\n=== Resolution Summary ===")
-        print(f"Total files checked : {stats['total_files']}")
-        print(f"Successfully mapped : {stats['resolved']}")
-        print(f"Unmatched (outside) : {stats['unmatched']}")
-        print(f"Output exported to  : {args.output_csv}")
+        safe_print("\n=== Resolution Summary ===")
+        safe_print(f"Total files checked : {stats['total_files']}")
+        safe_print(f"Successfully mapped : {stats['resolved']}")
+        safe_print(f"Unmatched (outside) : {stats['unmatched']}")
+        safe_print(f"Output exported to  : {args.output_csv}")
 
         return 0
     except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+        safe_print(f"ERROR: {e}", file=sys.stderr)
+        if args.verbose:
+            tb = "".join(traceback.format_exc())
+            safe_print(tb, file=sys.stderr)
         return 1
 
 

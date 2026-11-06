@@ -11,7 +11,7 @@
     SharePoint Online web URL.
 
     Pure native PowerShell 5.1+ / PowerShell 7+ implementation with ZERO required external
-    modules or administrative rights.
+    modules or administrative rights. All screen logs redact local user profile paths.
 
 .PARAMETER Path
     Path to a local folder synchronized with OneDrive / SharePoint.
@@ -30,16 +30,13 @@
 
 .PARAMETER Mount
     Optional manual mapping override(s) formatted as 'LocalPath=RemoteUrl'.
-    Example: -Mount "C:\Users\John\OneDrive - Contoso=https://contoso.sharepoint.com/sites/Team"
+    Example: -Mount "C:\Users\<USER>\OneDrive - Contoso=https://contoso.sharepoint.com/sites/Team"
 
 .PARAMETER ListMounts
     Switch to display all discovered OneDrive / SharePoint mount points and exit.
 
-.EXAMPLE
-    .\Resolve-OneDriveToSharePointUrl.ps1 -Path "C:\Users\John\OneDrive - Company\Documents" -Recursive -Output ".\results.csv"
-
-.EXAMPLE
-    .\Resolve-OneDriveToSharePointUrl.ps1 -Csv ".\input_files.csv" -Column "FilePath" -Output ".\results.csv"
+.PARAMETER Verbose
+    Common parameter to output detailed diagnostic mapping steps.
 #>
 
 [CmdletBinding(DefaultParameterSetName = "Folder")]
@@ -67,9 +64,54 @@ param (
     [switch]$ListMounts
 )
 
-# Set StrictMode off to ensure flexible property access on heterogeneous Windows registry objects
+# Flexible property handling for registry objects
 Set-StrictMode -Off
-$ErrorActionPreference = "Stop"
+
+function Redact-LocalPath {
+    param ([string]$InputText)
+    if ([string]::IsNullOrWhiteSpace($InputText)) { return "" }
+    
+    $scrubbed = $InputText
+
+    # 1. Redact specific user profile directory if present
+    $userProfile = [System.Environment]::GetEnvironmentVariable("USERPROFILE")
+    if (-not [string]::IsNullOrWhiteSpace($userProfile)) {
+        $scrubbed = $scrubbed -replace [regex]::Escape($userProfile), "<USERPROFILE>"
+        $scrubbed = $scrubbed -replace [regex]::Escape($userProfile.Replace('\', '/')), "<USERPROFILE>"
+    }
+
+    $home = [System.Environment]::GetEnvironmentVariable("HOME")
+    if (-not [string]::IsNullOrWhiteSpace($home)) {
+        $scrubbed = $scrubbed -replace [regex]::Escape($home), "<USERPROFILE>"
+    }
+
+    # 2. Redact Windows C:\Users\<Username>
+    $scrubbed = [regex]::Replace($scrubbed, '([A-Za-z]:\\Users\\)[^\s\\''"\,]+', '$1<USER>', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    $scrubbed = [regex]::Replace($scrubbed, '([A-Za-z]:/Users/)[^\s/''"\,]+', '$1<USER>', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+    # 3. Redact explicit username
+    $username = [System.Environment]::GetEnvironmentVariable("USERNAME")
+    if (-not [string]::IsNullOrWhiteSpace($username) -and $username.Length -ge 3) {
+        $scrubbed = $scrubbed -replace [regex]::Escape($username), "<USER>"
+    }
+
+    return $scrubbed
+}
+
+function Write-SafeHost {
+    param (
+        [string]$Message,
+        [ConsoleColor]$ForegroundColor = [ConsoleColor]::White
+    )
+    $redacted = Redact-LocalPath $Message
+    Write-Host $redacted -ForegroundColor $ForegroundColor
+}
+
+function Write-SafeWarning {
+    param ([string]$Message)
+    $redacted = Redact-LocalPath $Message
+    Write-Warning $redacted
+}
 
 function Normalize-LocalPath {
     param ([string]$InputPath)
@@ -134,6 +176,7 @@ function Get-OneDriveSyncMappings {
         $baseKey = $hkcu.OpenSubKey($syncEnginesPath)
         if ($baseKey) {
             $subKeyNames = $baseKey.GetSubKeyNames()
+            Write-Verbose "[Registry SyncEngines] Found $($subKeyNames.Count) subkeys."
             foreach ($subName in $subKeyNames) {
                 try {
                     $subKey = $baseKey.OpenSubKey($subName)
@@ -142,12 +185,15 @@ function Get-OneDriveSyncMappings {
                         $urlNamespace = Safe-GetRegistryValue -Key $subKey -Names @("UrlNamespace", "Url", "WebUrl", "LibraryScopeUrl")
 
                         if (-not [string]::IsNullOrWhiteSpace($mountPoint) -and -not [string]::IsNullOrWhiteSpace($urlNamespace)) {
+                            $normMount = Normalize-LocalPath $mountPoint
+                            $cleanUrl = $urlNamespace.TrimEnd('/')
                             $mappings.Add([PSCustomObject]@{
-                                MountPoint   = Normalize-LocalPath $mountPoint
-                                UrlNamespace = $urlNamespace.TrimEnd('/')
+                                MountPoint   = $normMount
+                                UrlNamespace = $cleanUrl
                                 ScopeType    = "Business"
                                 AccountName  = $subName
                             })
+                            Write-Verbose "[Registry SyncEngines] Mapped $normMount -> $cleanUrl"
                         }
                         $subKey.Close()
                     }
@@ -158,7 +204,7 @@ function Get-OneDriveSyncMappings {
             $baseKey.Close()
         }
     } catch {
-        Write-Warning "Could not read SyncEngines registry: $_"
+        Write-SafeWarning "Could not read SyncEngines registry: $_"
     }
 
     # 3. Windows Registry: HKCU:\Software\Microsoft\OneDrive\Accounts
@@ -168,6 +214,7 @@ function Get-OneDriveSyncMappings {
         $baseKey = $hkcu.OpenSubKey($accountsPath)
         if ($baseKey) {
             $subKeyNames = $baseKey.GetSubKeyNames()
+            Write-Verbose "[Registry Accounts] Found $($subKeyNames.Count) accounts."
             foreach ($subName in $subKeyNames) {
                 try {
                     $subKey = $baseKey.OpenSubKey($subName)
@@ -179,12 +226,14 @@ function Get-OneDriveSyncMappings {
                         if (-not [string]::IsNullOrWhiteSpace($userFolder)) {
                             $normFolder = Normalize-LocalPath $userFolder
                             if (-not [string]::IsNullOrWhiteSpace($serviceUri)) {
+                                $cleanEndpoint = $serviceUri.TrimEnd('/')
                                 $mappings.Add([PSCustomObject]@{
                                     MountPoint   = $normFolder
-                                    UrlNamespace = $serviceUri.TrimEnd('/')
+                                    UrlNamespace = $cleanEndpoint
                                     ScopeType    = "Business"
                                     AccountName  = $subName
                                 })
+                                Write-Verbose "[Registry Accounts Root] Mapped $normFolder -> $cleanEndpoint"
                             } elseif ($subName -ieq "Personal" -or -not [string]::IsNullOrWhiteSpace($cid)) {
                                 $pUrl = if ($cid) { "https://onedrive.live.com/?cid=$cid" } else { "https://onedrive.live.com" }
                                 $mappings.Add([PSCustomObject]@{
@@ -193,8 +242,37 @@ function Get-OneDriveSyncMappings {
                                     ScopeType    = "Personal"
                                     AccountName  = $subName
                                 })
+                                Write-Verbose "[Registry Personal Root] Mapped $normFolder -> $pUrl"
                             }
                         }
+
+                        # Check ScopeId caches
+                        try {
+                            $mcKey = $subKey.OpenSubKey("ScopeIdToMountPointPathCache")
+                            $ucKey = $subKey.OpenSubKey("ScopeIdToWebUrlPathCache")
+                            if ($mcKey) {
+                                foreach ($valName in $mcKey.GetValueNames()) {
+                                    $mPath = $mcKey.GetValue($valName)
+                                    $uTarget = if ($ucKey) { $ucKey.GetValue($valName) } else { $null }
+                                    if ($mPath -and $uTarget) {
+                                        $normM = Normalize-LocalPath $mPath
+                                        $cleanU = $uTarget.ToString().Trim().TrimEnd('/')
+                                        $mappings.Add([PSCustomObject]@{
+                                            MountPoint   = $normM
+                                            UrlNamespace = $cleanU
+                                            ScopeType    = "Business"
+                                            AccountName  = "$($subName)_$($valName.Substring(0, [Math]::Min(8, $valName.Length)))"
+                                        })
+                                        Write-Verbose "[Registry ScopeIdCache] Mapped $normM -> $cleanU"
+                                    }
+                                }
+                                $mcKey.Close()
+                            }
+                            if ($ucKey) { $ucKey.Close() }
+                        } catch {
+                            # Ignore scope cache errors
+                        }
+
                         $subKey.Close()
                     }
                 } catch {
@@ -204,7 +282,7 @@ function Get-OneDriveSyncMappings {
             $baseKey.Close()
         }
     } catch {
-        Write-Warning "Could not read OneDrive Accounts registry: $_"
+        Write-SafeWarning "Could not read OneDrive Accounts registry: $_"
     }
 
     # Sort descending by MountPoint length (longest matching folder path wins)
@@ -277,19 +355,19 @@ function Resolve-PathToUrl {
 $allMappings = Get-OneDriveSyncMappings -ManualMounts $Mount
 
 if ($ListMounts) {
-    Write-Host "Discovered $($allMappings.Count) OneDrive / SharePoint sync mapping(s):" -ForegroundColor Cyan
+    Write-SafeHost "`nDiscovered $($allMappings.Count) OneDrive / SharePoint sync mapping(s):" -ForegroundColor Cyan
     $i = 1
     foreach ($m in $allMappings) {
-        Write-Host " [$i] [$($m.ScopeType)] Local: $($m.MountPoint)" -ForegroundColor Green
-        Write-Host "      Remote: $($m.UrlNamespace)" -ForegroundColor Gray
+        Write-SafeHost " [$i] [$($m.ScopeType)] Local: $($m.MountPoint)" -ForegroundColor Green
+        Write-SafeHost "      Remote: $($m.UrlNamespace)" -ForegroundColor Gray
         $i++
     }
     exit 0
 }
 
 if ($allMappings.Count -eq 0) {
-    Write-Warning "No active OneDrive / SharePoint sync mappings detected in registry."
-    Write-Warning "Use -Mount 'C:\Local\Path=https://tenant.sharepoint.com/sites/library' to supply manual mappings."
+    Write-SafeWarning "No active OneDrive / SharePoint sync mappings detected in registry."
+    Write-SafeWarning "Use -Mount 'C:\Users\<USER>\OneDrive - Company=https://company.sharepoint.com/sites/library' to supply manual mappings."
 }
 
 # Collect target files
@@ -298,10 +376,10 @@ $targetFiles = [System.Collections.Generic.List[string]]::new()
 if ($PSCmdlet.ParameterSetName -eq "Folder") {
     $normFolder = Normalize-LocalPath $Path
     if (-not (Test-Path $normFolder -PathType Container)) {
-        throw "Directory not found: $normFolder"
+        throw "Directory not found: $(Redact-LocalPath $normFolder)"
     }
 
-    Write-Host "Scanning folder: $normFolder (Recursive: $Recursive)..." -ForegroundColor Cyan
+    Write-SafeHost "Scanning folder: $normFolder (Recursive: $Recursive)..." -ForegroundColor Cyan
     $gciParams = @{
         Path        = $normFolder
         File        = $true
@@ -321,10 +399,10 @@ if ($PSCmdlet.ParameterSetName -eq "Folder") {
 } elseif ($PSCmdlet.ParameterSetName -eq "CsvInput") {
     $normCsv = Normalize-LocalPath $Csv
     if (-not (Test-Path $normCsv -PathType Leaf)) {
-        throw "CSV file not found: $normCsv"
+        throw "CSV file not found: $(Redact-LocalPath $normCsv)"
     }
 
-    Write-Host "Reading file paths from CSV: $normCsv..." -ForegroundColor Cyan
+    Write-SafeHost "Reading file paths from CSV: $normCsv..." -ForegroundColor Cyan
     $csvData = Import-Csv -Path $normCsv
     if ($csvData.Count -gt 0) {
         $targetCol = $Column
@@ -356,8 +434,10 @@ foreach ($f in $targetFiles) {
     
     if ($res.Status -eq "RESOLVED") {
         $resolvedCount++
+        Write-Verbose "  [OK] $([System.IO.Path]::GetFileName($normF)) -> $($res.WebUrl)"
     } else {
         $unmatchedCount++
+        Write-Verbose "  [SKIP] $([System.IO.Path]::GetFileName($normF)) (Not in any mount)"
     }
 
     $results.Add([PSCustomObject]@{
@@ -371,8 +451,8 @@ foreach ($f in $targetFiles) {
 
 $results | Export-Csv -Path $outputResolved -NoTypeInformation -Encoding utf8
 
-Write-Host "`n=== Resolution Summary ===" -ForegroundColor Green
-Write-Host "Total files checked : $($targetFiles.Count)"
-Write-Host "Successfully mapped : $resolvedCount"
-Write-Host "Unmatched (outside) : $unmatchedCount"
-Write-Host "Output exported to  : $outputResolved`n"
+Write-SafeHost "`n=== Resolution Summary ===" -ForegroundColor Green
+Write-SafeHost "Total files checked : $($targetFiles.Count)"
+Write-SafeHost "Successfully mapped : $resolvedCount"
+Write-SafeHost "Unmatched (outside) : $unmatchedCount"
+Write-SafeHost "Output exported to  : $outputResolved`n"
