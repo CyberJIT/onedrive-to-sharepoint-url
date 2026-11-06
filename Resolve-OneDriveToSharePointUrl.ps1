@@ -67,14 +67,14 @@ param (
     [switch]$ListMounts
 )
 
-Set-StrictMode -Version Latest
+# Set StrictMode off to ensure flexible property access on heterogeneous Windows registry objects
+Set-StrictMode -Off
 $ErrorActionPreference = "Stop"
 
 function Normalize-LocalPath {
     param ([string]$InputPath)
     if ([string]::IsNullOrWhiteSpace($InputPath)) { return "" }
     
-    # Expand environment variables and relative path
     $expanded = [System.Environment]::ExpandEnvironmentVariables($InputPath)
     $resolved = [System.IO.Path]::GetFullPath($expanded)
     
@@ -86,6 +86,25 @@ function Normalize-LocalPath {
     }
     
     return $resolved.TrimEnd('\')
+}
+
+function Safe-GetRegistryValue {
+    param (
+        [Microsoft.Win32.RegistryKey]$Key,
+        [string[]]$Names
+    )
+    if (-not $Key) { return $null }
+    foreach ($n in $Names) {
+        try {
+            $val = $Key.GetValue($n, $null)
+            if ($null -ne $val -and -not [string]::IsNullOrWhiteSpace($val.ToString())) {
+                return $val.ToString().Trim()
+            }
+        } catch {
+            # Continue checking fallback property names
+        }
+    }
+    return $null
 }
 
 function Get-OneDriveSyncMappings {
@@ -109,69 +128,83 @@ function Get-OneDriveSyncMappings {
     }
 
     # 2. Windows Registry: HKCU:\Software\SyncEngines\Providers\OneDrive
-    $syncEnginesReg = "HKCU:\Software\SyncEngines\Providers\OneDrive"
-    if (Test-Path $syncEnginesReg) {
-        try {
-            $subKeys = Get-ChildItem -Path $syncEnginesReg -ErrorAction SilentlyContinue
-            foreach ($sub in $subKeys) {
-                $mountPoint = (Get-ItemProperty -Path $sub.PSPath -Name "MountPoint" -ErrorAction SilentlyContinue).MountPoint
-                
-                $urlNamespace = $null
-                foreach ($prop in @("UrlNamespace", "WebUrl", "LibraryScopeUrl")) {
-                    $val = (Get-ItemProperty -Path $sub.PSPath -Name $prop -ErrorAction SilentlyContinue).$prop
-                    if (-not [string]::IsNullOrWhiteSpace($val)) {
-                        $urlNamespace = $val
-                        break
-                    }
-                }
+    $syncEnginesPath = "Software\SyncEngines\Providers\OneDrive"
+    try {
+        $hkcu = [Microsoft.Win32.Registry]::CurrentUser
+        $baseKey = $hkcu.OpenSubKey($syncEnginesPath)
+        if ($baseKey) {
+            $subKeyNames = $baseKey.GetSubKeyNames()
+            foreach ($subName in $subKeyNames) {
+                try {
+                    $subKey = $baseKey.OpenSubKey($subName)
+                    if ($subKey) {
+                        $mountPoint = Safe-GetRegistryValue -Key $subKey -Names @("MountPoint")
+                        $urlNamespace = Safe-GetRegistryValue -Key $subKey -Names @("UrlNamespace", "Url", "WebUrl", "LibraryScopeUrl")
 
-                if (-not [string]::IsNullOrWhiteSpace($mountPoint) -and -not [string]::IsNullOrWhiteSpace($urlNamespace)) {
-                    $mappings.Add([PSCustomObject]@{
-                        MountPoint   = Normalize-LocalPath $mountPoint
-                        UrlNamespace = $urlNamespace.TrimEnd('/')
-                        ScopeType    = "Business"
-                        AccountName  = $sub.PSChildName
-                    })
+                        if (-not [string]::IsNullOrWhiteSpace($mountPoint) -and -not [string]::IsNullOrWhiteSpace($urlNamespace)) {
+                            $mappings.Add([PSCustomObject]@{
+                                MountPoint   = Normalize-LocalPath $mountPoint
+                                UrlNamespace = $urlNamespace.TrimEnd('/')
+                                ScopeType    = "Business"
+                                AccountName  = $subName
+                            })
+                        }
+                        $subKey.Close()
+                    }
+                } catch {
+                    # Ignore individual inaccessible subkey
                 }
             }
-        } catch {
-            Write-Warning "Could not read SyncEngines registry: $_"
+            $baseKey.Close()
         }
+    } catch {
+        Write-Warning "Could not read SyncEngines registry: $_"
     }
 
     # 3. Windows Registry: HKCU:\Software\Microsoft\OneDrive\Accounts
-    $accountsReg = "HKCU:\Software\Microsoft\OneDrive\Accounts"
-    if (Test-Path $accountsReg) {
-        try {
-            $accKeys = Get-ChildItem -Path $accountsReg -ErrorAction SilentlyContinue
-            foreach ($acc in $accKeys) {
-                $userFolder = (Get-ItemProperty -Path $acc.PSPath -Name "UserFolder" -ErrorAction SilentlyContinue).UserFolder
-                $serviceUri = (Get-ItemProperty -Path $acc.PSPath -Name "ServiceEndpointUri" -ErrorAction SilentlyContinue).ServiceEndpointUri
-                $cid = (Get-ItemProperty -Path $acc.PSPath -Name "CID" -ErrorAction SilentlyContinue).CID
+    $accountsPath = "Software\Microsoft\OneDrive\Accounts"
+    try {
+        $hkcu = [Microsoft.Win32.Registry]::CurrentUser
+        $baseKey = $hkcu.OpenSubKey($accountsPath)
+        if ($baseKey) {
+            $subKeyNames = $baseKey.GetSubKeyNames()
+            foreach ($subName in $subKeyNames) {
+                try {
+                    $subKey = $baseKey.OpenSubKey($subName)
+                    if ($subKey) {
+                        $userFolder = Safe-GetRegistryValue -Key $subKey -Names @("UserFolder")
+                        $serviceUri = Safe-GetRegistryValue -Key $subKey -Names @("ServiceEndpointUri", "ServiceEndpointUriSharedWithMe", "DavUrlNamespace")
+                        $cid = Safe-GetRegistryValue -Key $subKey -Names @("CID")
 
-                if (-not [string]::IsNullOrWhiteSpace($userFolder)) {
-                    $normFolder = Normalize-LocalPath $userFolder
-                    if (-not [string]::IsNullOrWhiteSpace($serviceUri)) {
-                        $mappings.Add([PSCustomObject]@{
-                            MountPoint   = $normFolder
-                            UrlNamespace = $serviceUri.TrimEnd('/')
-                            ScopeType    = "Business"
-                            AccountName  = $acc.PSChildName
-                        })
-                    } elseif ($acc.PSChildName -eq "Personal" -or -not [string]::IsNullOrWhiteSpace($cid)) {
-                        $pUrl = if ($cid) { "https://onedrive.live.com/?cid=$cid" } else { "https://onedrive.live.com" }
-                        $mappings.Add([PSCustomObject]@{
-                            MountPoint   = $normFolder
-                            UrlNamespace = $pUrl
-                            ScopeType    = "Personal"
-                            AccountName  = $acc.PSChildName
-                        })
+                        if (-not [string]::IsNullOrWhiteSpace($userFolder)) {
+                            $normFolder = Normalize-LocalPath $userFolder
+                            if (-not [string]::IsNullOrWhiteSpace($serviceUri)) {
+                                $mappings.Add([PSCustomObject]@{
+                                    MountPoint   = $normFolder
+                                    UrlNamespace = $serviceUri.TrimEnd('/')
+                                    ScopeType    = "Business"
+                                    AccountName  = $subName
+                                })
+                            } elseif ($subName -ieq "Personal" -or -not [string]::IsNullOrWhiteSpace($cid)) {
+                                $pUrl = if ($cid) { "https://onedrive.live.com/?cid=$cid" } else { "https://onedrive.live.com" }
+                                $mappings.Add([PSCustomObject]@{
+                                    MountPoint   = $normFolder
+                                    UrlNamespace = $pUrl
+                                    ScopeType    = "Personal"
+                                    AccountName  = $subName
+                                })
+                            }
+                        }
+                        $subKey.Close()
                     }
+                } catch {
+                    # Ignore individual account key error
                 }
             }
-        } catch {
-            Write-Warning "Could not read OneDrive Accounts registry: $_"
+            $baseKey.Close()
         }
+    } catch {
+        Write-Warning "Could not read OneDrive Accounts registry: $_"
     }
 
     # Sort descending by MountPoint length (longest matching folder path wins)
