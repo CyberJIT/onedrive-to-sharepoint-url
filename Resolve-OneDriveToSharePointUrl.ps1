@@ -1,0 +1,345 @@
+<#
+.SYNOPSIS
+    Resolves local OneDrive and SharePoint synced file paths to SharePoint Online URLs
+    and exports them to a CSV file.
+
+.DESCRIPTION
+    Resolve-OneDriveToSharePointUrl inspects the Windows Registry for OneDrive / SharePoint
+    sync scopes (HKCU:\Software\SyncEngines\Providers\OneDrive and HKCU:\Software\Microsoft\OneDrive\Accounts).
+    It scans a local directory (optionally recursive) or reads an input CSV file containing paths,
+    matches each file to its corresponding MountPoint, and constructs the user-friendly
+    SharePoint Online web URL.
+
+    Pure native PowerShell 5.1+ / PowerShell 7+ implementation with ZERO required external
+    modules or administrative rights.
+
+.PARAMETER Path
+    Path to a local folder synchronized with OneDrive / SharePoint.
+
+.PARAMETER Csv
+    Path to an input CSV file containing local file paths.
+
+.PARAMETER Output
+    Destination path for the generated CSV report.
+
+.PARAMETER Recursive
+    Switch to scan folders and subfolders recursively.
+
+.PARAMETER Column
+    Header name of the column in the input CSV containing file paths (default: first column).
+
+.PARAMETER Mount
+    Optional manual mapping override(s) formatted as 'LocalPath=RemoteUrl'.
+    Example: -Mount "C:\Users\John\OneDrive - Contoso=https://contoso.sharepoint.com/sites/Team"
+
+.PARAMETER ListMounts
+    Switch to display all discovered OneDrive / SharePoint mount points and exit.
+
+.EXAMPLE
+    .\Resolve-OneDriveToSharePointUrl.ps1 -Path "C:\Users\John\OneDrive - Company\Documents" -Recursive -Output ".\results.csv"
+
+.EXAMPLE
+    .\Resolve-OneDriveToSharePointUrl.ps1 -Csv ".\input_files.csv" -Column "FilePath" -Output ".\results.csv"
+#>
+
+[CmdletBinding(DefaultParameterSetName = "Folder")]
+param (
+    [Parameter(Mandatory = $true, ParameterSetName = "Folder", Position = 0)]
+    [string]$Path,
+
+    [Parameter(Mandatory = $true, ParameterSetName = "CsvInput")]
+    [string]$Csv,
+
+    [Parameter(Mandatory = $true, ParameterSetName = "Folder")]
+    [Parameter(Mandatory = $true, ParameterSetName = "CsvInput")]
+    [string]$Output,
+
+    [Parameter(ParameterSetName = "Folder")]
+    [switch]$Recursive,
+
+    [Parameter(ParameterSetName = "CsvInput")]
+    [string]$Column,
+
+    [Parameter(Mandatory = $false)]
+    [string[]]$Mount,
+
+    [Parameter(Mandatory = $true, ParameterSetName = "List")]
+    [switch]$ListMounts
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Normalize-LocalPath {
+    param ([string]$InputPath)
+    if ([string]::IsNullOrWhiteSpace($InputPath)) { return "" }
+    
+    # Expand environment variables and relative path
+    $expanded = [System.Environment]::ExpandEnvironmentVariables($InputPath)
+    $resolved = [System.IO.Path]::GetFullPath($expanded)
+    
+    # Remove extended length prefix if present
+    if ($resolved.StartsWith("\\?\UNC\")) {
+        $resolved = "\\" + $resolved.Substring(8)
+    } elseif ($resolved.StartsWith("\\?\")) {
+        $resolved = $resolved.Substring(4)
+    }
+    
+    return $resolved.TrimEnd('\')
+}
+
+function Get-OneDriveSyncMappings {
+    param ([string[]]$ManualMounts)
+
+    $mappings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    # 1. Manual mount overrides (highest priority)
+    if ($ManualMounts) {
+        foreach ($m in $ManualMounts) {
+            if ($m -like "*=*") {
+                $parts = $m -split "=", 2
+                $mappings.Add([PSCustomObject]@{
+                    MountPoint   = Normalize-LocalPath $parts[0].Trim()
+                    UrlNamespace = $parts[1].Trim().TrimEnd('/')
+                    ScopeType    = "Manual"
+                    AccountName  = "CLI_OVERRIDE"
+                })
+            }
+        }
+    }
+
+    # 2. Windows Registry: HKCU:\Software\SyncEngines\Providers\OneDrive
+    $syncEnginesReg = "HKCU:\Software\SyncEngines\Providers\OneDrive"
+    if (Test-Path $syncEnginesReg) {
+        try {
+            $subKeys = Get-ChildItem -Path $syncEnginesReg -ErrorAction SilentlyContinue
+            foreach ($sub in $subKeys) {
+                $mountPoint = (Get-ItemProperty -Path $sub.PSPath -Name "MountPoint" -ErrorAction SilentlyContinue).MountPoint
+                
+                $urlNamespace = $null
+                foreach ($prop in @("UrlNamespace", "WebUrl", "LibraryScopeUrl")) {
+                    $val = (Get-ItemProperty -Path $sub.PSPath -Name $prop -ErrorAction SilentlyContinue).$prop
+                    if (-not [string]::IsNullOrWhiteSpace($val)) {
+                        $urlNamespace = $val
+                        break
+                    }
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($mountPoint) -and -not [string]::IsNullOrWhiteSpace($urlNamespace)) {
+                    $mappings.Add([PSCustomObject]@{
+                        MountPoint   = Normalize-LocalPath $mountPoint
+                        UrlNamespace = $urlNamespace.TrimEnd('/')
+                        ScopeType    = "Business"
+                        AccountName  = $sub.PSChildName
+                    })
+                }
+            }
+        } catch {
+            Write-Warning "Could not read SyncEngines registry: $_"
+        }
+    }
+
+    # 3. Windows Registry: HKCU:\Software\Microsoft\OneDrive\Accounts
+    $accountsReg = "HKCU:\Software\Microsoft\OneDrive\Accounts"
+    if (Test-Path $accountsReg) {
+        try {
+            $accKeys = Get-ChildItem -Path $accountsReg -ErrorAction SilentlyContinue
+            foreach ($acc in $accKeys) {
+                $userFolder = (Get-ItemProperty -Path $acc.PSPath -Name "UserFolder" -ErrorAction SilentlyContinue).UserFolder
+                $serviceUri = (Get-ItemProperty -Path $acc.PSPath -Name "ServiceEndpointUri" -ErrorAction SilentlyContinue).ServiceEndpointUri
+                $cid = (Get-ItemProperty -Path $acc.PSPath -Name "CID" -ErrorAction SilentlyContinue).CID
+
+                if (-not [string]::IsNullOrWhiteSpace($userFolder)) {
+                    $normFolder = Normalize-LocalPath $userFolder
+                    if (-not [string]::IsNullOrWhiteSpace($serviceUri)) {
+                        $mappings.Add([PSCustomObject]@{
+                            MountPoint   = $normFolder
+                            UrlNamespace = $serviceUri.TrimEnd('/')
+                            ScopeType    = "Business"
+                            AccountName  = $acc.PSChildName
+                        })
+                    } elseif ($acc.PSChildName -eq "Personal" -or -not [string]::IsNullOrWhiteSpace($cid)) {
+                        $pUrl = if ($cid) { "https://onedrive.live.com/?cid=$cid" } else { "https://onedrive.live.com" }
+                        $mappings.Add([PSCustomObject]@{
+                            MountPoint   = $normFolder
+                            UrlNamespace = $pUrl
+                            ScopeType    = "Personal"
+                            AccountName  = $acc.PSChildName
+                        })
+                    }
+                }
+            }
+        } catch {
+            Write-Warning "Could not read OneDrive Accounts registry: $_"
+        }
+    }
+
+    # Sort descending by MountPoint length (longest matching folder path wins)
+    return $mappings | Sort-Object -Property { $_.MountPoint.Length } -Descending
+}
+
+function Encode-SharePointUrlPath {
+    param ([string]$RelativePath)
+    
+    $cleanParts = $RelativePath.Replace('\', '/').Trim('/').Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $encodedParts = foreach ($part in $cleanParts) {
+        [System.Uri]::EscapeDataString($part)
+    }
+    return [string]::Join('/', $encodedParts)
+}
+
+function Resolve-PathToUrl {
+    param (
+        [string]$FilePath,
+        [System.Collections.Generic.List[PSCustomObject]]$Mappings
+    )
+
+    $normFile = Normalize-LocalPath $FilePath
+    $bestMatch = $null
+    $maxLen = -1
+
+    foreach ($m in $Mappings) {
+        $mountPoint = $m.MountPoint
+        $prefixWithSlash = $mountPoint + '\'
+
+        if ($normFile -ieq $mountPoint -or $normFile.StartsWith($prefixWithSlash, [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ($mountPoint.Length -gt $maxLen) {
+                $maxLen = $mountPoint.Length
+                $bestMatch = $m
+            }
+        }
+    }
+
+    if (-not $bestMatch) {
+        return @{
+            WebUrl     = ""
+            MountPoint = ""
+            Status     = "NOT_IN_ONEDRIVE_MOUNT"
+        }
+    }
+
+    $relPath = ""
+    if ($normFile.Length -gt $bestMatch.MountPoint.Length) {
+        $relPath = $normFile.Substring($bestMatch.MountPoint.Length).TrimStart('\')
+    }
+
+    $encodedRel = Encode-SharePointUrlPath $relPath
+    $baseUrl = $bestMatch.UrlNamespace
+
+    if ($bestMatch.ScopeType -eq "Personal" -and $baseUrl -like "*onedrive.live.com*") {
+        $finalUrl = if ($encodedRel) { "$baseUrl&id=$([System.Uri]::EscapeDataString($relPath))" } else { $baseUrl }
+    } else {
+        $finalUrl = if ($encodedRel) { "$baseUrl/$encodedRel" } else { $baseUrl }
+    }
+
+    return @{
+        WebUrl     = $finalUrl
+        MountPoint = $bestMatch.MountPoint
+        Status     = "RESOLVED"
+    }
+}
+
+# --- Execution ---
+
+$allMappings = Get-OneDriveSyncMappings -ManualMounts $Mount
+
+if ($ListMounts) {
+    Write-Host "Discovered $($allMappings.Count) OneDrive / SharePoint sync mapping(s):" -ForegroundColor Cyan
+    $i = 1
+    foreach ($m in $allMappings) {
+        Write-Host " [$i] [$($m.ScopeType)] Local: $($m.MountPoint)" -ForegroundColor Green
+        Write-Host "      Remote: $($m.UrlNamespace)" -ForegroundColor Gray
+        $i++
+    }
+    exit 0
+}
+
+if ($allMappings.Count -eq 0) {
+    Write-Warning "No active OneDrive / SharePoint sync mappings detected in registry."
+    Write-Warning "Use -Mount 'C:\Local\Path=https://tenant.sharepoint.com/sites/library' to supply manual mappings."
+}
+
+# Collect target files
+$targetFiles = [System.Collections.Generic.List[string]]::new()
+
+if ($PSCmdlet.ParameterSetName -eq "Folder") {
+    $normFolder = Normalize-LocalPath $Path
+    if (-not (Test-Path $normFolder -PathType Container)) {
+        throw "Directory not found: $normFolder"
+    }
+
+    Write-Host "Scanning folder: $normFolder (Recursive: $Recursive)..." -ForegroundColor Cyan
+    $gciParams = @{
+        Path        = $normFolder
+        File        = $true
+        Force       = $false
+        ErrorAction = "SilentlyContinue"
+    }
+    if ($Recursive) {
+        $gciParams.Recurse = $true
+    }
+
+    $files = Get-ChildItem @gciParams | Where-Object {
+        $_.Name -notin @("desktop.ini", "thumbs.db", ".DS_Store")
+    }
+    foreach ($f in $files) {
+        $targetFiles.Add($f.FullName)
+    }
+} elseif ($PSCmdlet.ParameterSetName -eq "CsvInput") {
+    $normCsv = Normalize-LocalPath $Csv
+    if (-not (Test-Path $normCsv -PathType Leaf)) {
+        throw "CSV file not found: $normCsv"
+    }
+
+    Write-Host "Reading file paths from CSV: $normCsv..." -ForegroundColor Cyan
+    $csvData = Import-Csv -Path $normCsv
+    if ($csvData.Count -gt 0) {
+        $targetCol = $Column
+        if ([string]::IsNullOrWhiteSpace($targetCol)) {
+            $targetCol = $csvData[0].PSObject.Properties.Name | Select-Object -First 1
+        }
+        foreach ($row in $csvData) {
+            $val = $row.$targetCol
+            if (-not [string]::IsNullOrWhiteSpace($val)) {
+                $targetFiles.Add($val.Trim())
+            }
+        }
+    }
+}
+
+$outputResolved = Normalize-LocalPath $Output
+$outputDir = [System.IO.Path]::GetDirectoryName($outputResolved)
+if (-not [string]::IsNullOrWhiteSpace($outputDir) -and -not (Test-Path $outputDir)) {
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+}
+
+$results = [System.Collections.Generic.List[PSCustomObject]]::new()
+$resolvedCount = 0
+$unmatchedCount = 0
+
+foreach ($f in $targetFiles) {
+    $normF = Normalize-LocalPath $f
+    $res = Resolve-PathToUrl -FilePath $normF -Mappings $allMappings
+    
+    if ($res.Status -eq "RESOLVED") {
+        $resolvedCount++
+    } else {
+        $unmatchedCount++
+    }
+
+    $results.Add([PSCustomObject]@{
+        local_file_path        = $normF
+        file_name              = [System.IO.Path]::GetFileName($normF)
+        sharepoint_web_url     = $res.WebUrl
+        sharepoint_mount_point = $res.MountPoint
+        resolution_status      = $res.Status
+    })
+}
+
+$results | Export-Csv -Path $outputResolved -NoTypeInformation -Encoding utf8
+
+Write-Host "`n=== Resolution Summary ===" -ForegroundColor Green
+Write-Host "Total files checked : $($targetFiles.Count)"
+Write-Host "Successfully mapped : $resolvedCount"
+Write-Host "Unmatched (outside) : $unmatchedCount"
+Write-Host "Output exported to  : $outputResolved`n"
